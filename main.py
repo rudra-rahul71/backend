@@ -68,6 +68,16 @@ async def websocket_audio_endpoint(websocket: WebSocket):
         await client_receive_queue.put(None) # Signal shutdown
         gemini_task.cancel()
 
+@app.post("/api/jobs")
+async def create_job(job: dict):
+    """
+    REST endpoint to save a finalized job when the user is online.
+    In production this would persist to a database.
+    """
+    logger.info(f"Job submitted: {job}")
+    # TODO: persist to database
+    return {"status": "success", "message": "Job saved.", "job": job}
+
 @app.post("/api/offline-upload")
 async def offline_upload_endpoint(
     audio: UploadFile = File(...),
