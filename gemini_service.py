@@ -23,11 +23,12 @@ def update_job_details(
     homeowner_phone: str,
     homeowner_address: str,
     job_description: str,
-    service_sector: ServiceSector,
+    service_sector: str,
     homeowner_approved: bool
 ) -> dict:
     """
     Updates the job details on the user's checklist. Use this tool whenever you have extracted or updated information about the job.
+    service_sector must be one of: PLUMBING, HVAC, ELECTRICAL, APPLIANCES, LANDSCAPING, UNKNOWN.
     """
     return {"status": "success"}
 
@@ -38,6 +39,118 @@ Listen to the audio. As soon as you identify any required entities for a job ref
 If the technician corrects themselves (e.g., "Wait, it's HVAC, not plumbing"), fire the tool again with the updated information.
 Your ONLY goal is to extract: Homeowner Name, Phone, Address, Job Description, Service Sector, and if they approved the estimate.
 """
+
+REQUIRED_FIELDS = ["homeowner_name", "homeowner_phone", "homeowner_address", "job_description", "service_sector"]
+VALID_SECTORS = {"PLUMBING", "HVAC", "ELECTRICAL", "APPLIANCES", "LANDSCAPING", "UNKNOWN"}
+
+BATCH_SYSTEM_INSTRUCTION = """
+You are TradeEngage AI, assisting field service technicians.
+You will receive an audio recording from a field technician who was dictating job details.
+Listen to the ENTIRE audio carefully, then extract ALL of the following information and call the 'update_job_details' tool ONCE with everything you found:
+- Homeowner Name
+- Homeowner Phone
+- Homeowner Address
+- Job Description
+- Service Sector (one of: PLUMBING, HVAC, ELECTRICAL, APPLIANCES, LANDSCAPING, UNKNOWN)
+- Whether the homeowner approved the estimate (true/false)
+
+If some information is missing from the audio, still call the tool with whatever you did find — leave missing string fields as empty strings and missing booleans as false.
+"""
+
+
+def check_completeness(job: dict) -> tuple[bool, list[str]]:
+    """Check if all required job fields are filled in."""
+    missing = []
+    for field in REQUIRED_FIELDS:
+        value = job.get(field)
+        if value is None or (isinstance(value, str) and value.strip() == ""):
+            missing.append(field)
+        elif field == "service_sector" and value == "UNKNOWN":
+            missing.append(field)
+    return len(missing) == 0, missing
+
+
+async def process_offline_audio(audio_bytes: bytes, mime_type: str, partial_metadata: dict | None = None) -> dict:
+    """
+    Process a saved audio file using the Gemini Content API (non-streaming batch mode).
+    Returns { job: {...}, isComplete: bool, missingFields: [...] }
+    """
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_api_key:
+        raise ValueError("GEMINI_API_KEY is not set")
+
+    client = genai.Client(api_key=gemini_api_key)
+
+    # Build the prompt
+    prompt_parts = []
+    if partial_metadata:
+        non_empty = {k: v for k, v in partial_metadata.items() if v}
+        if non_empty:
+            prompt_parts.append(
+                f"The following fields were already extracted during a partial live session: {json.dumps(non_empty)}. "
+                "Please verify and complete the remaining fields from the audio."
+            )
+    prompt_parts.append("Listen to the attached audio recording and extract all job details using the update_job_details tool.")
+
+    try:
+        logger.info(f"Using inline audio bytes. Size: {len(audio_bytes)} bytes, mime_type: {mime_type}")
+        base_mime = mime_type.split(";")[0].strip()
+
+        # Call generate_content with function calling
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_bytes(data=audio_bytes, mime_type=base_mime),
+                        types.Part.from_text("\n".join(prompt_parts)),
+                    ]
+                )
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=BATCH_SYSTEM_INSTRUCTION,
+                tools=[update_job_details],
+            ),
+        )
+
+        # Parse tool call from response
+        job = {
+            "homeowner_name": "",
+            "homeowner_phone": "",
+            "homeowner_address": "",
+            "job_description": "",
+            "service_sector": "UNKNOWN",
+            "homeowner_approved": False,
+        }
+
+        if response.candidates:
+            for part in response.candidates[0].content.parts:
+                if part.function_call and part.function_call.name == "update_job_details":
+                    args = dict(part.function_call.args)
+                    logger.info(f"Batch Gemini extracted: {args}")
+                    # Validate service_sector against allowed values
+                    if "service_sector" in args:
+                        sector = args["service_sector"].upper().strip()
+                        args["service_sector"] = sector if sector in VALID_SECTORS else "UNKNOWN"
+                    job.update(args)
+                    break
+
+        # Merge with partial metadata (prefer Gemini's extraction over partial)
+        if partial_metadata:
+            for key, value in partial_metadata.items():
+                if key in job and (not job[key] or job[key] == "UNKNOWN") and value:
+                    job[key] = value
+
+        is_complete, missing_fields = check_completeness(job)
+        logger.info(f"Job completeness: {is_complete}, missing: {missing_fields}")
+
+        return {"job": job, "isComplete": is_complete, "missingFields": missing_fields}
+
+    except Exception as e:
+        logger.error(f"Error during offline Gemini processing: {e}")
+        raise
+
 
 async def handle_gemini_session(websocket: WebSocket, client_receive_queue):
     """
@@ -93,6 +206,7 @@ async def handle_gemini_session(websocket: WebSocket, client_receive_queue):
             
             # Task to receive from Gemini and send to Frontend
             async def receive_from_gemini():
+              try:
                 while True:
                     async for response in session.receive():
                         # Handle audio responses from Gemini
@@ -140,7 +254,15 @@ async def handle_gemini_session(websocket: WebSocket, client_receive_queue):
                                             )
                                         ]
                                     ))
-            
+              except asyncio.CancelledError:
+                logger.info("receive_from_gemini task cancelled.")
+              except Exception as e:
+                # ConnectionClosedOK (code 1000) is expected on normal session end
+                if "1000" in str(e):
+                    logger.info("Gemini session closed normally.")
+                else:
+                    logger.error(f"receive_from_gemini error: {e}")
+
             task_send = asyncio.create_task(send_to_gemini())
             task_receive = asyncio.create_task(receive_from_gemini())
             

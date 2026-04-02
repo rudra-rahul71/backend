@@ -10,12 +10,15 @@ from dotenv import load_dotenv
 # Load env vars
 load_dotenv()
 
-from gemini_service import handle_gemini_session
+from gemini_service import handle_gemini_session, process_offline_audio, check_completeness
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="TradeEngage Backend")
+
+# Mock database (in-memory list for PoC)
+mock_db: list[dict] = []
 
 app.add_middleware(
     CORSMiddleware,
@@ -72,32 +75,81 @@ async def websocket_audio_endpoint(websocket: WebSocket):
 async def create_job(job: dict):
     """
     REST endpoint to save a finalized job when the user is online.
-    In production this would persist to a database.
+    Validates required fields before persisting.
     """
     logger.info(f"Job submitted: {job}")
-    # TODO: persist to database
-    return {"status": "success", "message": "Job saved.", "job": job}
+    
+    is_complete, missing_fields = check_completeness(job)
+    if not is_complete:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "Missing required fields", "missingFields": missing_fields}
+        )
+    
+    # Save to mock DB
+    import uuid
+    from datetime import datetime
+    job_record = {
+        "id": str(uuid.uuid4()),
+        "created_at": datetime.utcnow().isoformat(),
+        **job
+    }
+    mock_db.append(job_record)
+    logger.info(f"Job saved to mock DB. Total jobs: {len(mock_db)}")
+    
+    return {"status": "success", "message": "Job saved.", "job": job_record}
+
+
+@app.get("/api/jobs")
+async def list_jobs():
+    """List all jobs in mock DB (for debugging)."""
+    return {"jobs": mock_db}
+
 
 @app.post("/api/offline-upload")
 async def offline_upload_endpoint(
     audio: UploadFile = File(...),
-    metadata: str = Form(...)  # JSON string of any local state we already had
+    metadata: str = Form(default="{}")  # JSON string of any partial state from live session
 ):
     """
-    REST Endpoint for the Store & Forward architecture.
-    Receives an audio file captured when the app was offline and processes it asynchronously.
+    Store & Forward endpoint.
+    Receives an audio file captured offline, processes it through Gemini's batch API,
+    and returns the extracted job form with completeness info.
     """
-    # In a full-scale app, we would save this file to an S3 bucket and trigger a Celery task.
-    # For this PoC, we will simulate receiving and logging the metadata.
     try:
-        data = json.loads(metadata)
-        logger.info(f"Received offline upload. File size: {audio.size} bytes. Metadata: {data}")
-        # Here we would initialize a non-streaming Gemini call on `audio` to extract remaining data
-        # and update the database with the finalized job.
-        return {"status": "success", "message": "Offline payload received and queued for processing."}
+        partial_metadata = json.loads(metadata) if metadata else {}
+        audio_bytes = await audio.read()
+        mime_type = audio.content_type or "audio/wav"
+        
+        logger.info(f"Offline upload received. Size: {len(audio_bytes)} bytes, type: {mime_type}, partial: {partial_metadata}")
+        
+        # Process through Gemini batch API
+        result = await process_offline_audio(audio_bytes, mime_type, partial_metadata)
+        
+        # If the form is complete, auto-save to mock DB
+        if result["isComplete"]:
+            import uuid
+            from datetime import datetime
+            job_record = {
+                "id": str(uuid.uuid4()),
+                "created_at": datetime.utcnow().isoformat(),
+                "source": "offline_upload",
+                **result["job"]
+            }
+            mock_db.append(job_record)
+            logger.info(f"Complete offline job auto-saved. Total jobs: {len(mock_db)}")
+            result["job"] = job_record
+        
+        return result
+        
+    except ValueError as e:
+        logger.error(f"Offline processing error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         logger.error(f"Offline processing error: {e}")
-        raise HTTPException(status_code=400, detail="Invalid request format")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Failed to process offline audio")
 
 if __name__ == "__main__":
     import uvicorn
