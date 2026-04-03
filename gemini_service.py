@@ -110,7 +110,13 @@ async def process_offline_audio(audio_bytes: bytes, mime_type: str, partial_meta
             ],
             config=types.GenerateContentConfig(
                 system_instruction=BATCH_SYSTEM_INSTRUCTION,
-                tools=[update_job_details],
+                tools=[{"function_declarations": [{"name": "update_job_details", "description": "Updates the job details on the user's checklist. Use this tool whenever you have extracted or updated information about the job.", "parameters": {"type": "OBJECT", "properties": {"homeowner_name": {"type": "STRING"}, "homeowner_phone": {"type": "STRING"}, "homeowner_address": {"type": "STRING"}, "job_description": {"type": "STRING"}, "service_sector": {"type": "STRING", "enum": ["PLUMBING", "HVAC", "ELECTRICAL", "APPLIANCES", "LANDSCAPING", "UNKNOWN"]}, "homeowner_approved": {"type": "BOOLEAN"}}, "required": ["homeowner_name", "homeowner_phone", "homeowner_address", "job_description", "service_sector"]}}]}],
+                tool_config=types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(
+                        mode="ANY",
+                        allowed_function_names=["update_job_details"]
+                    )
+                ),
             ),
         )
 
